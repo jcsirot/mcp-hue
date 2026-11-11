@@ -1,3 +1,5 @@
+mod config;
+mod hue;
 mod server;
 
 use std::net::SocketAddr;
@@ -8,7 +10,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use tracing_subscriber::EnvFilter;
 
-use crate::server::HueServer;
+use crate::{config::Config, server::HueServer};
 
 /// Environment variable holding the listen address (`ip:port`).
 const BIND_ENV: &str = "HUE_MCP_BIND";
@@ -18,17 +20,35 @@ const MCP_PATH: &str = "/mcp";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // A `.env` file is optional; real environment variables take precedence.
+    let dotenv = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    if let Err(err) = dotenv
+        && !err.not_found()
+    {
+        tracing::warn!("ignoring unreadable .env file: {err}");
+    }
 
     let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned());
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid {BIND_ENV} value: {bind:?}"))?;
 
+    let config = Config::from_env();
+    tracing::info!(
+        bridge_host = config.bridge_host.as_deref().unwrap_or("<not configured>"),
+        app_key_configured = config.app_key.is_some(),
+        bridge_id_pinned = config.bridge_id.is_some(),
+        "Hue bridge configuration loaded"
+    );
+    let hue_server = HueServer::new(&config).context("cannot set up the Hue bridge client")?;
+
     let service: StreamableHttpService<HueServer, LocalSessionManager> = StreamableHttpService::new(
-        || Ok(HueServer),
+        move || Ok(hue_server.clone()),
         Default::default(),
         StreamableHttpServerConfig::default(),
     );
