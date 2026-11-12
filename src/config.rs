@@ -57,9 +57,46 @@ impl Config {
     }
 }
 
+/// Loads the optional `.env` file; real environment variables take precedence.
+/// Returns a warning to log when the file exists but could not be loaded entirely.
+pub fn load_dotenv() -> Option<String> {
+    dotenvy::dotenv().err().and_then(|err| dotenv_warning(&err))
+}
+
+fn dotenv_warning(err: &dotenvy::Error) -> Option<String> {
+    if err.not_found() {
+        return None;
+    }
+    Some(match err {
+        // The parse error quotes the faulty line, which may hold the application
+        // key: never forward it.
+        dotenvy::Error::LineParse(..) => "the .env file has a syntax error and was only \
+            partially loaded (line not shown: it may hold a secret)"
+            .to_owned(),
+        dotenvy::Error::Io(io) => format!("the .env file could not be read: {io}"),
+        _ => "the .env file could not be loaded".to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotenv_syntax_error_warning_hides_the_line() {
+        let err = dotenvy::Error::LineParse("HUE_APP_KEY=\"secret-key".to_owned(), 12);
+        assert!(err.to_string().contains("secret-key"), "premise changed");
+
+        let warning = dotenv_warning(&err).unwrap();
+        assert!(!warning.contains("secret-key"), "key leaked in: {warning}");
+        assert!(warning.contains("syntax error"));
+    }
+
+    #[test]
+    fn missing_dotenv_file_is_silent() {
+        let err = dotenvy::Error::Io(std::io::ErrorKind::NotFound.into());
+        assert_eq!(dotenv_warning(&err), None);
+    }
 
     fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {

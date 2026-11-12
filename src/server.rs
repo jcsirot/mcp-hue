@@ -16,6 +16,8 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct HueServer {
     bridge: Option<Bridge>,
+    /// Kept apart from `bridge`: a key can be configured without a bridge address.
+    key_configured: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +75,10 @@ pub struct BridgeStatus {
 impl HueServer {
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         let Some(host) = &config.bridge_host else {
-            return Ok(Self::default());
+            return Ok(Self {
+                bridge: None,
+                key_configured: config.app_key.is_some(),
+            });
         };
         let client =
             HueClient::for_host(host, config.app_key.clone(), config.bridge_id.as_deref())?;
@@ -82,6 +87,7 @@ impl HueServer {
 
     fn with_client(address: &str, client: HueClient) -> Self {
         Self {
+            key_configured: client.has_app_key(),
             bridge: Some(Bridge {
                 address: address.to_owned(),
                 client,
@@ -95,7 +101,7 @@ impl HueServer {
                 address: None,
                 address_source: None,
                 reachable: false,
-                key_configured: false,
+                key_configured: self.key_configured,
                 authenticated: false,
                 bridge: None,
                 message: format!(
@@ -108,7 +114,7 @@ impl HueServer {
             address: Some(bridge.address.clone()),
             address_source: Some(AddressSource::Configured),
             reachable: false,
-            key_configured: bridge.client.has_app_key(),
+            key_configured: self.key_configured,
             authenticated: false,
             bridge: None,
             message: String::new(),
@@ -269,6 +275,19 @@ mod tests {
             "{}",
             status.message
         );
+    }
+
+    #[tokio::test]
+    async fn status_reports_configured_key_without_address() {
+        let config = Config {
+            app_key: Some(AppKey::new(VALID_KEY)),
+            ..Config::default()
+        };
+        let status = HueServer::new(&config).unwrap().status().await;
+
+        assert!(status.key_configured);
+        assert!(!status.reachable && !status.authenticated);
+        assert_eq!(status.address, None);
     }
 
     #[tokio::test]

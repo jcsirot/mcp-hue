@@ -20,17 +20,15 @@ const MCP_PATH: &str = "/mcp";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // A `.env` file is optional; real environment variables take precedence.
-    let dotenv = dotenvy::dotenv();
+    // Loaded before logging is set up, so that `.env` can also set `RUST_LOG`.
+    let dotenv_warning = config::load_dotenv();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    if let Err(err) = dotenv
-        && !err.not_found()
-    {
-        tracing::warn!("ignoring unreadable .env file: {err}");
+    if let Some(warning) = dotenv_warning {
+        tracing::warn!("{warning}");
     }
 
     let bind = std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned());

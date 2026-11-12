@@ -87,6 +87,9 @@ impl HueClient {
             .tls_backend_preconfigured(tls::client_config(expected_bridge_id)?)
             // The bridge is a device on the local network: never go through a proxy.
             .no_proxy()
+            // A bridge never redirects. Following a redirect could replay the
+            // application key header outside the verified connection.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(options.connect_timeout)
             .timeout(options.request_timeout)
             .build()?;
@@ -254,6 +257,26 @@ mod tests {
         let err = client(&bridge.uri(), Some(KEY)).bridge_info().await;
         assert!(matches!(err, Err(HueError::Timeout)), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn never_follows_redirects_with_the_key() {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let bridge = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("Location", elsewhere.uri().as_str()),
+            )
+            .mount(&bridge)
+            .await;
+
+        let err = client(&bridge.uri(), Some(KEY)).check_auth().await;
+        assert!(matches!(err, Err(HueError::Unexpected(_))), "{err:?}");
+        assert!(elsewhere.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
