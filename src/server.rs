@@ -38,6 +38,10 @@ enum BridgeSource {
 struct Bridge {
     address: String,
     client: HueClient,
+    /// Announced bridge id, for a discovered bridge.
+    bridge_id: Option<String>,
+    /// Identifies the cache entry this bridge came from (0 when configured).
+    generation: u64,
 }
 
 type FindFuture = Pin<Box<dyn Future<Output = Result<DiscoveredBridge, DiscoveryError>> + Send>>;
@@ -48,10 +52,21 @@ type ConnectFn =
 /// Finds the bridge on first use, then keeps its address until it stops answering.
 struct Discovery {
     app_key: Option<AppKey>,
+    /// `HUE_BRIDGE_ID`, if set.
     expected_bridge_id: Option<String>,
     find: FindFn,
     connect: ConnectFn,
-    cache: Mutex<Option<Bridge>>,
+    cache: Mutex<Cache>,
+}
+
+#[derive(Default)]
+struct Cache {
+    bridge: Option<Bridge>,
+    /// Incremented each time a new bridge is remembered.
+    generation: u64,
+    /// Id of the bridge that accepted the application key. Kept for the life of
+    /// the server, across failed searches: the key is never sent to another bridge.
+    pinned_bridge_id: Option<String>,
 }
 
 impl fmt::Debug for Discovery {
@@ -64,30 +79,74 @@ impl fmt::Debug for Discovery {
 }
 
 enum DiscoveryFailure {
-    Search(DiscoveryError),
+    Search {
+        error: DiscoveryError,
+        /// Set when the search was restricted to the bridge that accepted the key,
+        /// rather than to `HUE_BRIDGE_ID`.
+        pinned_bridge_id: Option<String>,
+    },
     Client(String),
 }
 
 impl Discovery {
-    /// The bridge to talk to: the remembered one, or a new search when `refresh`
-    /// is set or nothing is remembered. Failures are not remembered.
-    async fn bridge(&self, refresh: bool) -> Result<Bridge, DiscoveryFailure> {
+    /// The remembered bridge, or the result of a new search if none is remembered.
+    async fn bridge(&self) -> Result<Bridge, DiscoveryFailure> {
         let mut cache = self.cache.lock().await;
-        if !refresh && let Some(bridge) = cache.as_ref() {
+        if let Some(bridge) = &cache.bridge {
             return Ok(bridge.clone());
         }
-        *cache = None;
-        let found = (self.find)(self.expected_bridge_id.clone())
+        self.search(&mut cache).await
+    }
+
+    /// Replaces `stale`, which stopped answering. If another caller already
+    /// replaced it, that replacement is reused instead of searching again.
+    async fn refresh(&self, stale: &Bridge) -> Result<Bridge, DiscoveryFailure> {
+        let mut cache = self.cache.lock().await;
+        if let Some(bridge) = &cache.bridge
+            && bridge.generation != stale.generation
+        {
+            return Ok(bridge.clone());
+        }
+        self.search(&mut cache).await
+    }
+
+    /// Remembers that `bridge` accepted the application key.
+    async fn pin(&self, bridge: &Bridge) {
+        let mut cache = self.cache.lock().await;
+        if cache.pinned_bridge_id.is_none()
+            && let Some(id) = &bridge.bridge_id
+        {
+            tracing::info!(bridge_id = %id, "Hue bridge accepted the key; later searches are restricted to it");
+            cache.pinned_bridge_id = Some(id.clone());
+        }
+    }
+
+    /// Searches the network. A failed search forgets the stale bridge but not the
+    /// pinned bridge id.
+    async fn search(&self, cache: &mut Cache) -> Result<Bridge, DiscoveryFailure> {
+        cache.bridge = None;
+        let pinned_bridge_id = match &self.expected_bridge_id {
+            Some(_) => None,
+            None => cache.pinned_bridge_id.clone(),
+        };
+        let expected = self.expected_bridge_id.clone().or(pinned_bridge_id.clone());
+        let found = (self.find)(expected)
             .await
-            .map_err(DiscoveryFailure::Search)?;
+            .map_err(|error| DiscoveryFailure::Search {
+                error,
+                pinned_bridge_id,
+            })?;
         tracing::info!(bridge_id = %found.bridge_id, host = %found.host, "Hue bridge discovered via mDNS");
         let client = (self.connect)(&found, self.app_key.clone())
             .map_err(|err| DiscoveryFailure::Client(format!("{err:#}")))?;
+        cache.generation += 1;
         let bridge = Bridge {
             address: found.host,
             client,
+            bridge_id: Some(found.bridge_id),
+            generation: cache.generation,
         };
-        *cache = Some(bridge.clone());
+        cache.bridge = Some(bridge.clone());
         Ok(bridge)
     }
 }
@@ -168,6 +227,8 @@ impl HueServer {
             source: BridgeSource::Configured(Bridge {
                 address: address.to_owned(),
                 client,
+                bridge_id: None,
+                generation: 0,
             }),
         }
     }
@@ -180,7 +241,7 @@ impl HueServer {
                 expected_bridge_id: config.bridge_id.clone(),
                 find,
                 connect,
-                cache: Mutex::new(None),
+                cache: Mutex::default(),
             })),
         }
     }
@@ -193,19 +254,19 @@ impl HueServer {
             BridgeSource::Discovered(discovery) => discovery,
         };
 
-        let bridge = match discovery.bridge(false).await {
+        let bridge = match discovery.bridge().await {
             Ok(bridge) => bridge,
             Err(failure) => return self.discovery_failed(failure),
         };
-        let status = self.check(&bridge, AddressSource::Discovered).await;
+        let status = self.check_discovered(discovery, &bridge).await;
         if status.reachable {
             return status;
         }
 
         // The remembered address may be stale (new DHCP lease…): search again once.
-        match discovery.bridge(true).await {
+        match discovery.refresh(&bridge).await {
             Ok(fresh) if fresh.address != bridge.address => {
-                self.check(&fresh, AddressSource::Discovered).await
+                self.check_discovered(discovery, &fresh).await
             }
             Ok(_) => status,
             Err(failure) => {
@@ -220,18 +281,45 @@ impl HueServer {
         }
     }
 
+    /// Checks a discovered bridge and, once it accepts the key, pins its id.
+    async fn check_discovered(&self, discovery: &Discovery, bridge: &Bridge) -> BridgeStatus {
+        let status = self.check(bridge, AddressSource::Discovered).await;
+        if status.authenticated {
+            discovery.pin(bridge).await;
+        }
+        status
+    }
+
     fn discovery_failed(&self, failure: DiscoveryFailure) -> BridgeStatus {
         let message = match failure {
-            DiscoveryFailure::Search(err @ DiscoveryError::NotFound) => format!(
+            DiscoveryFailure::Search {
+                error: err @ DiscoveryError::NotFoundWithId { .. },
+                pinned_bridge_id: Some(pinned),
+            } => format!(
+                "The bridge used so far ({pinned}) no longer answers: {err}. The server does not send the application key to another bridge. Check the bridge, or set {BRIDGE_ID_ENV} or {BRIDGE_HOST_ENV} and restart the server to use another one."
+            ),
+            DiscoveryFailure::Search {
+                error: err @ DiscoveryError::NotFound,
+                ..
+            } => format!(
                 "{BRIDGE_HOST_ENV} is not set and {err} through mDNS. Check that the server is on the same network as the bridge (a VPN or a virtual machine network can block multicast), or set {BRIDGE_HOST_ENV} to the bridge IP address."
             ),
-            DiscoveryFailure::Search(err @ DiscoveryError::Ambiguous(_)) => format!(
+            DiscoveryFailure::Search {
+                error: err @ DiscoveryError::Ambiguous(_),
+                ..
+            } => format!(
                 "{BRIDGE_HOST_ENV} is not set and {err}. Set {BRIDGE_ID_ENV} to pick one, or set {BRIDGE_HOST_ENV}."
             ),
-            DiscoveryFailure::Search(err @ DiscoveryError::NotFoundWithId { .. }) => format!(
+            DiscoveryFailure::Search {
+                error: err @ DiscoveryError::NotFoundWithId { .. },
+                ..
+            } => format!(
                 "{BRIDGE_HOST_ENV} is not set and {err}. Check {BRIDGE_ID_ENV}, or set {BRIDGE_HOST_ENV}."
             ),
-            DiscoveryFailure::Search(err @ DiscoveryError::Unavailable(_)) => format!(
+            DiscoveryFailure::Search {
+                error: err @ DiscoveryError::Unavailable(_),
+                ..
+            } => format!(
                 "{BRIDGE_HOST_ENV} is not set and {err}. Set {BRIDGE_HOST_ENV} to the bridge IP address."
             ),
             DiscoveryFailure::Client(err) => {
@@ -367,16 +455,23 @@ mod tests {
                 self.searches.clone(),
                 self.asked_ids.clone(),
             );
-            let find: FindFn = Arc::new(move |expected| {
+            let find: FindFn = Arc::new(move |expected: Option<String>| {
                 searches.fetch_add(1, Ordering::SeqCst);
-                asked.lock().unwrap().push(expected);
+                asked.lock().unwrap().push(expected.clone());
                 let mut results = results.lock().unwrap();
                 let next = if results.len() > 1 {
                     results.remove(0)
                 } else {
                     results[0].clone()
                 };
-                Box::pin(async move { next })
+                // Like the real search: an expected id filters what was found.
+                let next =
+                    next.and_then(|found| discovery::select(vec![found], expected.as_deref()));
+                Box::pin(async move {
+                    // Leaves time for concurrent callers to overlap.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    next
+                })
             });
             let connect: ConnectFn = Arc::new(|found: &DiscoveredBridge, app_key| {
                 HueClient::new(format!("http://{}", found.host), app_key, None, options())
@@ -390,8 +485,12 @@ mod tests {
     }
 
     fn found(host: &str) -> Result<DiscoveredBridge, DiscoveryError> {
+        found_with_id("ecb5fafffe13af9c", host)
+    }
+
+    fn found_with_id(id: &str, host: &str) -> Result<DiscoveredBridge, DiscoveryError> {
         Ok(DiscoveredBridge {
-            bridge_id: "ecb5fafffe13af9c".to_owned(),
+            bridge_id: id.to_owned(),
             host: host.to_owned(),
         })
     }
@@ -587,5 +686,101 @@ mod tests {
             *discovery.asked_ids.lock().unwrap(),
             [Some("ecb5fafffe13af9c".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn never_switches_to_another_bridge_once_one_accepted_the_key() {
+        let first = fake_bridge().await;
+        let other = fake_bridge().await;
+        let discovery = FakeDiscovery::new(vec![
+            found_with_id("aaaa", host_of(&first.uri())),
+            found_with_id("bbbb", host_of(&other.uri())),
+        ]);
+        let server = discovery.server(&with_key());
+        assert!(server.status().await.authenticated);
+
+        first.reset().await; // the bridge that accepted the key stops answering
+        let status = server.status().await;
+
+        assert!(!status.reachable && !status.authenticated);
+        assert!(
+            status.message.contains("(aaaa) no longer answers")
+                && status.message.contains("does not send the application key"),
+            "{}",
+            status.message
+        );
+        assert_eq!(
+            *discovery.asked_ids.lock().unwrap(),
+            [None, Some("aaaa".to_owned())]
+        );
+        assert!(other.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn keeps_the_pinned_id_across_failed_searches() {
+        let first = fake_bridge().await;
+        let other = fake_bridge().await;
+        let discovery = FakeDiscovery::new(vec![
+            found_with_id("aaaa", host_of(&first.uri())),
+            Err(DiscoveryError::NotFound),
+            found_with_id("bbbb", host_of(&other.uri())),
+        ]);
+        let server = discovery.server(&with_key());
+        assert!(server.status().await.authenticated);
+
+        first.reset().await;
+        assert!(!server.status().await.reachable); // search finds nothing
+        assert!(!server.status().await.reachable); // search finds another bridge
+
+        assert_eq!(
+            discovery
+                .asked_ids
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_deref(),
+            Some("aaaa")
+        );
+        assert!(other.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn does_not_pin_a_bridge_that_rejected_the_key() {
+        let first = fake_bridge().await;
+        let other = fake_bridge().await;
+        let discovery = FakeDiscovery::new(vec![
+            found_with_id("aaaa", host_of(&first.uri())),
+            found_with_id("bbbb", host_of(&other.uri())),
+        ]);
+        let config = Config {
+            app_key: Some(AppKey::new("wrong-key")),
+            ..Config::default()
+        };
+        let server = discovery.server(&config);
+        assert!(!server.status().await.authenticated);
+
+        first.reset().await;
+        let status = server.status().await;
+
+        assert!(status.reachable, "{}", status.message);
+        assert_eq!(status.address.as_deref(), Some(host_of(&other.uri())));
+        assert_eq!(*discovery.asked_ids.lock().unwrap(), [None, None]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_share_one_search() {
+        let bridge = fake_bridge().await;
+        let stale = closed_port_url();
+        let discovery =
+            FakeDiscovery::new(vec![found(host_of(&stale)), found(host_of(&bridge.uri()))]);
+        let server = discovery.server(&with_key());
+        let other_session = server.clone();
+
+        let (first, second) = tokio::join!(server.status(), other_session.status());
+
+        assert!(first.reachable && second.reachable);
+        // One search for the first address, one to replace it: not one per caller.
+        assert_eq!(discovery.searches(), 2);
     }
 }
