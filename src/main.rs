@@ -38,7 +38,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     tracing::info!(
-        bridge_host = config.bridge_host.as_deref().unwrap_or("<not configured>"),
+        bridge_host = config
+            .bridge_host
+            .as_deref()
+            .unwrap_or("<discovered via mDNS>"),
         app_key_configured = config.app_key.is_some(),
         bridge_id_pinned = config.bridge_id.is_some(),
         "Hue bridge configuration loaded"
