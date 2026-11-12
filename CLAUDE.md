@@ -80,6 +80,8 @@ before committing. Keep CI on Ubuntu runners only: do not add Windows or macOS j
   `chore/...`) and open a pull request.
 - Commit messages follow Conventional Commits with a scope, e.g.
   `feat(bridge): discover the bridge via mDNS`, `chore(ci): ...`, `docs: ...`.
+- Pull request titles follow the same Conventional Commits format, since the title
+  becomes the commit message on `main` when the pull request is squash-merged.
 - Pull requests are squash-merged. Their description has a **Rationale**, a **Summary**
   of the changes and a **Tests** checklist (automated checks and, when relevant, manual
   checks against a real bridge).
