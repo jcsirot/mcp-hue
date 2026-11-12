@@ -1,6 +1,7 @@
 //! Access to the Philips Hue bridge.
 
 mod client;
+pub mod discovery;
 #[cfg(test)]
 pub mod testing;
 mod tls;

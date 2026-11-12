@@ -8,6 +8,7 @@ license = "GPL-3.0-or-later"
 anyhow = "1.0.104"
 axum = "0.8.9"
 dotenvy = "0.15.7"
+mdns-sd = { version = "0.21.7", features = ["async"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json"] }
 rmcp = { version = "3.9.0", features = ["transport-streamable-http-server"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

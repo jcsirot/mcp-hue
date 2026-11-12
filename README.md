@@ -10,10 +10,9 @@ transport Streamable HTTP :
 | Outil | Rôle |
 | --- | --- |
 | `ping` | Vérifie que le serveur MCP répond. |
-| `bridge_status` | Diagnostic de la connexion au pont : joignable, clé acceptée, nom, modèle, identifiant et version. |
+| `bridge_status` | Diagnostic de la connexion au pont : joignable, origine de l'adresse, clé acceptée, nom, modèle, identifiant et version. |
 
-Le pilotage des lumières, la découverte mDNS du pont, le TLS et l'authentification
-du serveur MCP restent à faire.
+Le pilotage des lumières, le TLS et l'authentification du serveur MCP restent à faire.
 
 ## Configuration
 
@@ -22,9 +21,9 @@ est chargé s'il existe ; les variables d'environnement réelles restent priorit
 
 | Variable | Défaut | Rôle |
 | --- | --- | --- |
-| `HUE_BRIDGE_HOST` | — | Adresse du pont (`ip` ou `ip:port`). |
+| `HUE_BRIDGE_HOST` | — | Adresse du pont (`ip` ou `ip:port`). Sans elle, le pont est recherché par mDNS. |
 | `HUE_APP_KEY` | — | Clé d'application Hue. Secrète : ne pas la committer. |
-| `HUE_BRIDGE_ID` | — | Identifiant du pont (ex. `ecb5fafffe13af9c`). S'il est défini, le certificat du pont doit lui correspondre. |
+| `HUE_BRIDGE_ID` | — | Identifiant du pont (ex. `ecb5fafffe13af9c`). S'il est défini, le certificat du pont doit lui correspondre, et la recherche mDNS ne retient que ce pont. |
 | `HUE_MCP_BIND` | `127.0.0.1:8080` | Adresse d'écoute du serveur MCP (`ip:port`). |
 | `RUST_LOG` | `info` | Niveau de log. |
 
@@ -33,6 +32,21 @@ que la clé manque.
 
 Tant qu'il n'y a ni TLS ni authentification, ne pas exposer le serveur MCP
 au-delà de la boucle locale.
+
+### Découverte du pont
+
+Si `HUE_BRIDGE_HOST` n'est pas défini, le serveur cherche le service `_hue._tcp`
+par mDNS lors du premier appel à un outil, pendant 3 secondes au plus. L'adresse
+trouvée est mémorisée ; si le pont cesse de répondre, une nouvelle recherche est
+lancée. Si plusieurs ponts répondent, `bridge_status` les liste : définir
+`HUE_BRIDGE_ID` pour en choisir un.
+
+Le certificat du pont doit correspondre à l'identifiant annoncé, si bien qu'un
+appareil qui se ferait passer pour un pont est refusé.
+
+Le mDNS repose sur le multicast, qui ne traverse pas toujours un VPN ni le réseau
+d'une machine virtuelle. En cas d'échec, définir `HUE_BRIDGE_HOST` (une adresse
+fixe, réservée dans le DHCP du routeur, est alors préférable).
 
 ### Créer une clé d'application
 
