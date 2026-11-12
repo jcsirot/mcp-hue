@@ -31,7 +31,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Ces trois commandes sont exécutées par la CI GitHub Actions (Ubuntu et Windows) sur chaque pull request et chaque push vers `main`.
+Ces trois commandes sont exécutées par la CI GitHub Actions (Ubuntu) sur chaque pull request et chaque push vers `main`.
 
 ## Licence
 
